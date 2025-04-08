@@ -53,17 +53,34 @@ class PaymentExternalSystemAdapterImpl(
         try {
             logger.warn("[$accountName] Submitting payment request for payment $paymentId")
 
+            val transactionId = UUID.randomUUID()
+
+            if (isOverDeadline(deadline)) {
+                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                }
+                return
+            }
+
             while (!tokenBucket.tick()) {
                 Thread.sleep(5)
             }
 
-            val transactionId = UUID.randomUUID()
             logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
 
             // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
             // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+            }
+
+            if (isOverDeadline(deadline)) {
+                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                }
+                return
             }
 
             val request = Request.Builder().run {
@@ -109,6 +126,12 @@ class PaymentExternalSystemAdapterImpl(
         } finally {
             concurrencyLimiter.release()
         }
+    }
+
+    private fun isOverDeadline(deadline: Long): Boolean {
+        // Если текущее время плюс ожидаемое время обработки (умноженное на коэффициент 3) больше или равно дедлайну,
+        // считаем, что время истекло
+        return now() + requestAverageProcessingTime.toMillis() * 3 >= deadline
     }
 
     override fun price() = properties.price
