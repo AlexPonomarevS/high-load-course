@@ -14,7 +14,7 @@ import java.time.Duration
 import java.util.*
 import java.util.concurrent.Semaphore
 import java.util.concurrent.TimeUnit
-
+import kotlin.math.floor
 
 // Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
@@ -24,9 +24,10 @@ class PaymentExternalSystemAdapterImpl(
 
     companion object {
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
-
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
+        // MODIFICATION: Добавляем множество HTTP-кодов, для которых потребуется повторная попытка.
+        val RETRYABLE_HTTP_CODES = setOf(429, 500, 502, 503, 504)
     }
 
     private val serviceName = properties.serviceName
@@ -50,10 +51,9 @@ class PaymentExternalSystemAdapterImpl(
 
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
         concurrencyLimiter.acquire()
+        val transactionId = UUID.randomUUID()
         try {
             logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
-            val transactionId = UUID.randomUUID()
 
             if (isOverDeadline(deadline)) {
                 logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
@@ -68,9 +68,7 @@ class PaymentExternalSystemAdapterImpl(
             }
 
             logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
-
-            // Вне зависимости от исхода оплаты важно отметить что она была отправлена.
-            // Это требуется сделать ВО ВСЕХ СЛУЧАЯХ, поскольку эта информация используется сервисом тестирования.
+            // Фиксируем факт отправки платежа (независимо от результата)
             paymentESService.update(paymentId) {
                 it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
             }
@@ -88,38 +86,22 @@ class PaymentExternalSystemAdapterImpl(
                 post(emptyBody)
             }.build()
 
-            try {
-                client.newCall(request).execute().use { response ->
-                    val body = try {
-                        mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-                    } catch (e: Exception) {
-                        logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                        ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-                    }
+            // MODIFICATION: Вместо прямого вызова HTTP-запроса вызываем рекурсивный метод,
+            // реализующий синхронное выполнение с повторными попытками.
+            processPaymentReqSync(request, transactionId, paymentId, paymentStartedAt, deadline)
 
-                    logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-                    // Здесь мы обновляем состояние оплаты в зависимости от результата в базе данных оплат.
-                    // Это требуется сделать ВО ВСЕХ ИСХОДАХ (успешная оплата / неуспешная / ошибочная ситуация)
+        } catch (e: Exception) {
+            when (e) {
+                is SocketTimeoutException -> {
+                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
                     paymentESService.update(paymentId) {
-                        it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
                     }
                 }
-            } catch (e: Exception) {
-                when (e) {
-                    is SocketTimeoutException -> {
-                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                        }
-                    }
-
-                    else -> {
-                        logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-
-                        paymentESService.update(paymentId) {
-                            it.logProcessing(false, now(), transactionId, reason = e.message)
-                        }
+                else -> {
+                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                    paymentESService.update(paymentId) {
+                        it.logProcessing(false, now(), transactionId, reason = e.message)
                     }
                 }
             }
@@ -128,10 +110,52 @@ class PaymentExternalSystemAdapterImpl(
         }
     }
 
+    // MODIFICATION: Рекурсивный метод для синхронной обработки запроса с retry‑логикой.
+    private fun processPaymentReqSync(
+        request: Request,
+        transactionId: UUID,
+        paymentId: UUID,
+        paymentStartedAt: Long,
+        deadline: Long,
+        attemptNum: Int = 0
+    ) {
+        // Увеличиваем счетчик попыток; поскольку attemptNum не меняется, создаем новую переменную.
+        val nextAttempt = attemptNum + 1
+
+        // Ограничиваем число попыток, рассчитывая максимум, допустимый исходя из оставшегося времени.
+        if (nextAttempt > floor((deadline - paymentStartedAt - 1).toDouble() / properties.averageProcessingTime.toMillis() - 1).toLong()) {
+            logger.warn("[$accountName] Exceeded maximum attempts ($nextAttempt) for txId: $transactionId, payment: $paymentId")
+            return
+        }
+
+        client.newCall(request).execute().use { response ->
+            val body = try {
+                mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+            } catch (e: Exception) {
+                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
+                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+            }
+
+            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+
+            // Обновляем статус платежа — вне зависимости от результата.
+            paymentESService.update(paymentId) {
+                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+            }
+
+            // Если запрос не успешен или получен код, требующий повторной попытки, и дедлайн еще не закрыт,
+            // ждём согласно rateLimiter.tickBlocking() и повторяем вызов.
+            if ((!body.result || RETRYABLE_HTTP_CODES.contains(response.code)) && !isOverDeadline(deadline)) {
+                tokenBucket.tick()
+                processPaymentReqSync(request, transactionId, paymentId, paymentStartedAt, deadline, nextAttempt)
+            }
+        }
+    }
+
+    // MODIFICATION: Новый метод проверки оставшегося времени (дедлайна).
+    // Считаем, что если до дедлайна осталось меньше, чем дважды среднее время обработки, то начинать новую попытку не стоит.
     private fun isOverDeadline(deadline: Long): Boolean {
-        // Если текущее время плюс ожидаемое время обработки (умноженное на коэффициент 3) больше или равно дедлайну,
-        // считаем, что время истекло
-        return now() + requestAverageProcessingTime.toMillis() * 3 >= deadline
+        return deadline - now() < properties.averageProcessingTime.toMillis() * 2
     }
 
     override fun price() = properties.price
@@ -139,7 +163,6 @@ class PaymentExternalSystemAdapterImpl(
     override fun isEnabled() = properties.enabled
 
     override fun name() = properties.accountName
-
 }
 
 public fun now() = System.currentTimeMillis()
