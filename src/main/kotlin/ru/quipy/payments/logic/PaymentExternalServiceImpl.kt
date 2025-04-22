@@ -12,11 +12,12 @@ import ru.quipy.payments.api.PaymentAggregate
 import java.net.SocketTimeoutException
 import java.time.Duration
 import java.util.*
-import java.util.concurrent.Semaphore
-import java.util.concurrent.TimeUnit
+import java.util.LinkedList
+import java.util.concurrent.*
+import java.util.concurrent.locks.ReentrantLock
+import kotlin.concurrent.withLock
 import kotlin.math.floor
 
-// Advice: always treat time as a Duration
 class PaymentExternalSystemAdapterImpl(
     private val properties: PaymentAccountProperties,
     private val paymentESService: EventSourcingService<UUID, PaymentAggregate, PaymentAggregateState>
@@ -26,7 +27,6 @@ class PaymentExternalSystemAdapterImpl(
         val logger = LoggerFactory.getLogger(PaymentExternalSystemAdapter::class.java)
         val emptyBody = RequestBody.create(null, ByteArray(0))
         val mapper = ObjectMapper().registerKotlinModule()
-        // MODIFICATION: Добавляем множество HTTP-кодов, для которых потребуется повторная попытка.
         val RETRYABLE_HTTP_CODES = setOf(429, 500, 502, 503, 504)
     }
 
@@ -42,37 +42,83 @@ class PaymentExternalSystemAdapterImpl(
         window = 1,
         timeUnit = TimeUnit.SECONDS
     )
-
     private val concurrencyLimiter = Semaphore(parallelRequests)
-
     private val client = OkHttpClient.Builder()
-        .readTimeout(70, TimeUnit.SECONDS)
+        .callTimeout(Duration.ofMillis(requestAverageProcessingTime.toMillis() + 100))
         .build()
 
+    private val processingTimes = LinkedList<Long>()
+    private val processingTimesMaxSize = rateLimitPerSec * 2
+    private val mutex = ReentrantLock()
+
+    private val boundedQueue = LinkedBlockingQueue<Runnable>(12)
+    private val pool = ThreadPoolExecutor(
+        12, 32,
+        70, TimeUnit.SECONDS,
+        boundedQueue,
+        Executors.defaultThreadFactory(),
+        ThreadPoolExecutor.AbortPolicy()
+    )
+
     override fun performPaymentAsync(paymentId: UUID, amount: Int, paymentStartedAt: Long, deadline: Long) {
-        concurrencyLimiter.acquire()
+        logger.warn("[$accountName] Submitting payment request for payment $paymentId")
         val transactionId = UUID.randomUUID()
-        try {
-            logger.warn("[$accountName] Submitting payment request for payment $paymentId")
-
-            if (isOverDeadline(deadline)) {
-                logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
-                paymentESService.update(paymentId) {
-                    it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
-                }
-                return
-            }
-
-            while (!tokenBucket.tick()) {
-                Thread.sleep(5)
-            }
-
-            logger.info("[$accountName] Submit for $paymentId , txId: $transactionId")
-            // Фиксируем факт отправки платежа (независимо от результата)
+        logger.info("[$accountName] Submit for $paymentId , txId: $transactionId, amount: $amount")
+        paymentESService.update(paymentId) {
+            it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+        }
+        val request = Request.Builder().run {
+            url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}" +
+                    "&transactionId=$transactionId&paymentId=$paymentId&amount=$amount&timeout=${Duration.ofMillis(requestAverageProcessingTime.toMillis() - 50)}")
+            post(emptyBody)
+        }.build()
+        if (isOverDeadline(deadline)) {
+            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
             paymentESService.update(paymentId) {
-                it.logSubmission(success = true, transactionId, now(), Duration.ofMillis(now() - paymentStartedAt))
+                it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
             }
-
+            return
+        }
+        try {
+            pool.submit {
+                try {
+                    concurrencyLimiter.acquire()
+                    if (isOverDeadline(deadline)) {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                        }
+                        return@submit
+                    }
+                    tokenBucket.tick()
+                    if (isOverDeadline(deadline)) {
+                        logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
+                        paymentESService.update(paymentId) {
+                            it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
+                        }
+                        return@submit
+                    }
+                    processPaymentReqSync(request, transactionId, paymentId, amount, paymentStartedAt, deadline)
+                } catch (e: Exception) {
+                    when (e) {
+                        is SocketTimeoutException -> {
+                            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
+                            }
+                        }
+                        else -> {
+                            logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
+                            paymentESService.update(paymentId) {
+                                it.logProcessing(false, now(), transactionId, reason = e.message)
+                            }
+                        }
+                    }
+                } finally {
+                    concurrencyLimiter.release()
+                }
+            }
+        } catch (e: RejectedExecutionException) {
             if (isOverDeadline(deadline)) {
                 logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId")
                 paymentESService.update(paymentId) {
@@ -80,88 +126,121 @@ class PaymentExternalSystemAdapterImpl(
                 }
                 return
             }
-
-            val request = Request.Builder().run {
-                url("http://localhost:1234/external/process?serviceName=${serviceName}&accountName=${accountName}&transactionId=$transactionId&paymentId=$paymentId&amount=$amount")
-                post(emptyBody)
-            }.build()
-
-            // MODIFICATION: Вместо прямого вызова HTTP-запроса вызываем рекурсивный метод,
-            // реализующий синхронное выполнение с повторными попытками.
-            processPaymentReqSync(request, transactionId, paymentId, paymentStartedAt, deadline)
-
-        } catch (e: Exception) {
-            when (e) {
-                is SocketTimeoutException -> {
-                    logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = "Request timeout.")
-                    }
-                }
-                else -> {
-                    logger.error("[$accountName] Payment failed for txId: $transactionId, payment: $paymentId", e)
-                    paymentESService.update(paymentId) {
-                        it.logProcessing(false, now(), transactionId, reason = e.message)
-                    }
-                }
-            }
-        } finally {
-            concurrencyLimiter.release()
+            performPaymentAsync(paymentId, amount, paymentStartedAt, deadline)
         }
     }
 
-    // MODIFICATION: Рекурсивный метод для синхронной обработки запроса с retry‑логикой.
     private fun processPaymentReqSync(
         request: Request,
         transactionId: UUID,
         paymentId: UUID,
+        amount: Int,
         paymentStartedAt: Long,
         deadline: Long,
         attemptNum: Int = 0
     ) {
-        // Увеличиваем счетчик попыток; поскольку attemptNum не меняется, создаем новую переменную.
-        val nextAttempt = attemptNum + 1
-
-        // Ограничиваем число попыток, рассчитывая максимум, допустимый исходя из оставшегося времени.
-        if (nextAttempt > floor((deadline - paymentStartedAt - 1).toDouble() / properties.averageProcessingTime.toMillis() - 1).toLong()) {
-            logger.warn("[$accountName] Exceeded maximum attempts ($nextAttempt) for txId: $transactionId, payment: $paymentId")
+        if (!isNextAttemptRational(attemptNum, amount)) {
+            paymentESService.update(paymentId) {
+                it.logProcessing(false, now(), transactionId, reason = "Request's next attempt isn't rational.")
+            }
             return
         }
-
-        client.newCall(request).execute().use { response ->
-            val body = try {
-                mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
-            } catch (e: Exception) {
-                logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}")
-                ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
-            }
-
-            logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
-
-            // Обновляем статус платежа — вне зависимости от результата.
+        val nextAttempt = attemptNum + 1
+        val currentAvgPT = avgPT()
+        if (isOverDeadline(deadline, currentAvgPT)) {
+            logger.error("[$accountName] Payment timeout for txId: $transactionId, payment: $paymentId - deadline imminent (avgPT: ${currentAvgPT.toMillis()} ms)")
             paymentESService.update(paymentId) {
-                it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                it.logProcessing(false, now(), transactionId, reason = "Request deadline.")
             }
-
-            // Если запрос не успешен или получен код, требующий повторной попытки, и дедлайн еще не закрыт,
-            // ждём согласно rateLimiter.tickBlocking() и повторяем вызов.
-            if ((!body.result || RETRYABLE_HTTP_CODES.contains(response.code)) && !isOverDeadline(deadline)) {
-                tokenBucket.tick()
-                processPaymentReqSync(request, transactionId, paymentId, paymentStartedAt, deadline, nextAttempt)
+            return
+        }
+        val startTime = now()
+        try {
+            client.newCall(request).execute().use { response ->
+                val body = try {
+                    mapper.readValue(response.body?.string(), ExternalSysResponse::class.java)
+                } catch (e: Exception) {
+                    logger.error("[$accountName] [ERROR] Payment processed for txId: $transactionId, payment: $paymentId, result code: ${response.code}, reason: ${response.body?.string()}", e)
+                    ExternalSysResponse(transactionId.toString(), paymentId.toString(), false, e.message)
+                }
+                addProcessingTime(now() - startTime)
+                logger.warn("[$accountName] Payment processed for txId: $transactionId, payment: $paymentId, succeeded: ${body.result}, message: ${body.message}")
+                paymentESService.update(paymentId) {
+                    it.logProcessing(body.result, now(), transactionId, reason = body.message)
+                }
+                if ((!body.result || RETRYABLE_HTTP_CODES.contains(response.code)) && !isOverDeadline(deadline)) {
+                    waitUntilNextAllowedAttempt(startTime)
+                    processPaymentReqSync(request, transactionId, paymentId, amount, paymentStartedAt, deadline, nextAttempt)
+                }
+            }
+        } catch (e: Exception) {
+            if (!isOverDeadline(deadline, currentAvgPT)) {
+                waitUntilNextAllowedAttempt(startTime)
+                processPaymentReqSync(request, transactionId, paymentId, amount, paymentStartedAt, deadline, nextAttempt)
+            } else {
+                throw e
             }
         }
     }
 
-    // MODIFICATION: Новый метод проверки оставшегося времени (дедлайна).
-    // Считаем, что если до дедлайна осталось меньше, чем дважды среднее время обработки, то начинать новую попытку не стоит.
+    private fun waitUntilNextAllowedAttempt(startTime: Long) {
+        tokenBucket.tick()
+        val delta = now() - startTime
+        if (delta < 1000) {
+            Thread.sleep(1000 - delta)
+        }
+    }
+
+    private fun isNextAttemptRational(attemptNum: Int, amount: Int): Boolean {
+        if (properties.price >= amount) return false
+        if (attemptNum >= floor(6000.0 / properties.averageProcessingTime.toMillis())) return false
+        val totalCostIfFail = (attemptNum + 1) * properties.price
+        val expectedProfit = amount - totalCostIfFail
+        return expectedProfit >= 0
+    }
+
+    private fun addProcessingTime(duration: Long) {
+        mutex.withLock {
+            processingTimes.add(duration)
+            while (processingTimes.size > processingTimesMaxSize) {
+                processingTimes.removeFirst()
+            }
+        }
+    }
+
+    private fun calcPT(quantile: Double): Long {
+        mutex.withLock {
+            if (processingTimes.size < processingTimesMaxSize) {
+                return properties.averageProcessingTime.toMillis()
+            }
+            val sorted = processingTimes.sorted()
+            val size = sorted.size
+            val quantileIndex = (size - 1) * quantile
+            val lowerIndex = quantileIndex.toInt()
+            val fraction = quantileIndex - lowerIndex
+            return if (lowerIndex >= size - 1) {
+                sorted.last()
+            } else {
+                (sorted[lowerIndex] + (sorted[lowerIndex + 1] - sorted[lowerIndex]) * fraction).toLong()
+            }
+        }
+    }
+
+    private fun avgPT(): Duration {
+        val quantileValue = calcPT(0.5)
+        return Duration.ofMillis(quantileValue)
+    }
+
+    private fun isOverDeadline(deadline: Long, avgPT: Duration): Boolean {
+        return deadline - now() < avgPT.toMillis()
+    }
+
     private fun isOverDeadline(deadline: Long): Boolean {
         return deadline - now() < properties.averageProcessingTime.toMillis() * 2
     }
 
     override fun price() = properties.price
-
     override fun isEnabled() = properties.enabled
-
     override fun name() = properties.accountName
 }
 
